@@ -1,0 +1,137 @@
+version: '3.8'
+
+services:
+  postgres-shopcart:
+    image: pgvector/pgvector:pg16
+    container_name: shopcart-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: shopcart
+      POSTGRES_PASSWORD: shopcart_secret
+      POSTGRES_DB: shopcart_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - shopcart_pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init_shopcart.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shopcart -d shopcart_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  postgres-simbank:
+    image: postgres:16-alpine
+    container_name: simbank-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: simbank
+      POSTGRES_PASSWORD: simbank_secret
+      POSTGRES_DB: simbank_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - simbank_pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init_simbank.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U simbank -d simbank_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: shopcart-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  simbank:
+    build:
+      context: ./simbank
+      dockerfile: Dockerfile
+    container_name: shopcart-simbank
+    restart: unless-stopped
+    environment:
+      - APP_ENV=production
+      - SIMBANK_HOST=0.0.0.0
+      - SIMBANK_PORT=8001
+      - DATABASE_URL=postgresql+asyncpg://simbank:simbank_secret@postgres-simbank:5432/simbank_db
+      - SIMBANK_WEBHOOK_SECRET=simbank-hmac-sha256-webhook-shared-secret-key-shopcart
+      - SIMBANK_WEBHOOK_URL=http://backend:8000/api/v1/payments/webhooks/simbank
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres-simbank:
+        condition: service_healthy
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: shopcart-backend
+    restart: unless-stopped
+    environment:
+      - APP_ENV=production
+      - BACKEND_HOST=0.0.0.0
+      - BACKEND_PORT=8000
+      - DATABASE_URL=postgresql+asyncpg://shopcart:shopcart_secret@postgres-shopcart:5432/shopcart_db
+      - REDIS_URL=redis://redis:6379/0
+      - SIMBANK_URL=http://simbank:8001
+      - SIMBANK_WEBHOOK_SECRET=simbank-hmac-sha256-webhook-shared-secret-key-shopcart
+      - FRONTEND_URL=http://localhost:3000
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-mock-key}
+      - MOCK_ANTHROPIC=${MOCK_ANTHROPIC:-true}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres-shopcart:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      simbank:
+        condition: service_started
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: shopcart-worker
+    restart: unless-stopped
+    command: python -m app.workers.reconciliation_worker
+    environment:
+      - APP_ENV=production
+      - DATABASE_URL=postgresql+asyncpg://shopcart:shopcart_secret@postgres-shopcart:5432/shopcart_db
+      - REDIS_URL=redis://redis:6379/0
+      - SIMBANK_URL=http://simbank:8001
+    depends_on:
+      backend:
+        condition: service_started
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: shopcart-frontend
+    restart: unless-stopped
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_SIMBANK_URL=http://localhost:8001
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  shopcart_pgdata:
+  simbank_pgdata:
+  redis_data:
